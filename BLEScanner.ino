@@ -74,6 +74,8 @@ void cleanupTags()
 {
   updating = true;
   for (itags = bletags.begin(); itags != bletags.end();) {
+    if(xTaskGetTickCount() < (*itags).lastseen) // uptime counter overflow
+      (*itags).lastseen = xTaskGetTickCount();
     if((xTaskGetTickCount() - (*itags).lastseen) / 1000 > tagtimeout) {
       bletags.erase(itags++);
     } else {
