@@ -43,6 +43,8 @@ struct BLETag {
 std::list<BLETag> bletags;
 std::list<BLETag>::iterator itags;
 
+std::list<std::pair<std::string, TaskHandle_t>> tasks;
+
 
 class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks
 {
@@ -70,6 +72,7 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks
     }
 };
 
+
 void cleanupTags()
 {
   updating = true;
@@ -96,13 +99,11 @@ void bleTask(void * pvParameters)
   pBLEScan->setActiveScan(true);
   for (;;) {
     while(! doScan)
-      delay(500);
+      delay(1000);
     BLEScanResults foundDevices = pBLEScan->start(scanTime);
-    Serial.print(F("Free heap: "));
-    Serial.println(esp_get_free_heap_size());
-    dumpTags();
+    delay(500);
     cleanupTags();
-    delay(1000);
+    delay(1500);
   }
 }
 
@@ -111,16 +112,16 @@ void WiFiEvent(WiFiEvent_t event)
 {
   switch (event) {
     case SYSTEM_EVENT_STA_START:
-      WiFi.setHostname(hostname);
       Serial.println(F("SYSTEM_EVENT_STA_START"));
+      WiFi.setHostname(hostname);
       break;
     case SYSTEM_EVENT_STA_CONNECTED:
       Serial.println(F("SYSTEM_EVENT_STA_CONNECTED"));
       break;
     case SYSTEM_EVENT_STA_DISCONNECTED:
       Serial.println(F("SYSTEM_EVENT_STA_DISCONNECTED"));
-      WiFi.reconnect();
       doScan = false;
+      WiFi.reconnect();
       break;
     case SYSTEM_EVENT_STA_GOT_IP:
       Serial.println(F("SYSTEM_EVENT_STA_GOT_IP"));
@@ -238,12 +239,12 @@ void handleClient(void * pvParameters)
       }
     } else {
       if((xTaskGetTickCount() - lastreport) / 1000 >= timeout) {
-        if(cmac.length() > 0) {
+        if(cmac.length() > 0 && doScan) {
           printTags(client, cmac, timeout);
           lastreport = xTaskGetTickCount();
         }
       }
-      delay(100);
+      delay(500);
     }
   }
   client->stop();
@@ -282,11 +283,18 @@ void wifiTask(void * pvParameters)
         Serial.print(client->remoteIP().toString());
         Serial.print(":");
         Serial.println(client->remotePort());
-        // xTaskCreatePinnedToCore(handleClient, "clientTask", 2000, client, 1, NULL, 1);
-        xTaskCreate(handleClient, "clientTask", 2000, client, 1, NULL);
+
+        TaskHandle_t h_task;
+        String strremotePort(client->remotePort());
+        std::string tname = "clientTask_";
+        tname += client->remoteIP().toString().c_str();
+        tname += ":";
+        tname += strremotePort.c_str();
+        xTaskCreate(handleClient, tname.c_str(), 2000, client, 1, &h_task);
+        tasks.push_back(std::make_pair(tname, h_task));
         break;
       } else {
-        delay(100);
+        delay(500);
       }
     }
   }
@@ -328,9 +336,37 @@ void setup()
   Serial.print(F("CPU1 reset reason: "));
   verbose_print_reset_reason(rtc_get_reset_reason(1));
 
-  xTaskCreatePinnedToCore(bleTask, "bleTask", 20000, NULL, 0, NULL, 0);
-  xTaskCreatePinnedToCore(wifiTask, "wifiTask", 5000, NULL, 1, NULL, 1);
+  TaskHandle_t h_task;
+  xTaskCreatePinnedToCore(bleTask, "bleTask", 2000, NULL, 0, &h_task, 0);
+  tasks.push_back(std::make_pair("bleTask", h_task));
+  xTaskCreatePinnedToCore(wifiTask, "wifiTask", 2500, NULL, 1, &h_task, 1);
+  tasks.push_back(std::make_pair("wifiTask", h_task));
 }
 
 void loop() {
+  delay(2000);
+  Serial.print(F("Free heap: "));
+  Serial.println(esp_get_free_heap_size());
+  delay(2000);
+  std::list<std::pair<std::string, TaskHandle_t>>::iterator ittasks;
+  delay(16000);
+  for(ittasks = tasks.begin(); ittasks != tasks.end();)
+  {
+    if(eTaskGetState((*ittasks).second) == eReady) { // should be eDeleted?
+      tasks.erase(ittasks++);
+    } else {
+      Serial.print("Task ");
+      Serial.print(static_cast<std::string>((*ittasks).first).c_str());
+      Serial.print(" state: ");
+      Serial.print(eTaskGetState((*ittasks).second));
+      Serial.print(" free stack: ");
+      Serial.println(uxTaskGetStackHighWaterMark((*ittasks).second));
+      ++ittasks;
+    }
+  }
+  delay(2500);
+  Serial.print("Uptime: ");
+  Serial.println(xTaskGetTickCount());
+  delay(2500);
+  dumpTags();
 }
