@@ -8,12 +8,13 @@
 #include <rom/rtc.h>
 #include <deque>
 #include <list>
+#include <map>
 #include <algorithm>
 
-const char* ssid     = "ENTER_YOUR_WIFI_SSID_HERE";
-const char* password = "ENTER_YOUR_WIFI_PASSWORD_HERE";
-const char* hostname = "ENTER_THE_HOSTNAME_HERE";
-uint32_t tagtimeout = 180; // Remove BLETag from list if not seen for 180 seconds
++const char* ssid     = "ENTER_YOUR_WIFI_SSID_HERE";
++const char* password = "ENTER_YOUR_WIFI_PASSWORD_HERE";
++const char* hostname = "ENTER_THE_HOSTNAME_HERE";
+uint32_t tagtimeout = 300; // Remove BLETag from list if not seen for n seconds
 
 bool useStaticIP = false;
 IPAddress local_IP(192, 168, 178, 78);
@@ -22,7 +23,7 @@ IPAddress subnet(255, 255, 255, 0);
 IPAddress primaryDNS(192, 168, 178, 1); //optional
 IPAddress secondaryDNS(8, 8, 8, 8); //optional
 WiFiServer server(3333, 16);  // Port, Maxclients
-int scanTime = 10; //In seconds
+int scanTime = 8; //In seconds
 
 
 static BLEClient* pClient;
@@ -30,8 +31,11 @@ static BLEAddress* pAddress;
 static BLERemoteService* pRemoteService;
 static BLERemoteCharacteristic* pRemoteCharacteristic;
 
-bool updating = false;
-bool doScan = false;
+int reconnects = 0;
+bool wifiConnect = false;
+uint32_t bleScanWD;
+SemaphoreHandle_t  xMutexBleTags = xSemaphoreCreateMutex( );
+SemaphoreHandle_t  xMutexScan = xSemaphoreCreateMutex( );
 
 struct BLETag {
   std::string mac;
@@ -43,22 +47,25 @@ struct BLETag {
 std::list<BLETag> bletags;
 std::list<BLETag>::iterator itags;
 
-std::list<std::pair<std::string, TaskHandle_t>> tasks;
+std::map<TaskHandle_t, std::string> tasks;
+
 
 
 class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks
 {
     void onResult(BLEAdvertisedDevice advertisedDevice) {
-      updating = true;
+      xSemaphoreTake(xMutexBleTags, portMAX_DELAY);
       for (itags = bletags.begin(); itags != bletags.end(); ++itags) {
         if((*itags).mac == advertisedDevice.getAddress().toString()) {
           (*itags).lastseen = xTaskGetTickCount();
-          if (advertisedDevice.getName().length() > 0) {
+          if (advertisedDevice.getName().length() > 0 &&
+              advertisedDevice.getName() != (*itags).tname) {
             (*itags).tname = advertisedDevice.getName();
           }
+          
           (*itags).rssi.push_back(advertisedDevice.getRSSI());
           if((*itags).rssi.size() > 5) (*itags).rssi.pop_front();
-          updating = false;
+          xSemaphoreGive(xMutexBleTags);
           return;
         }
       }
@@ -68,14 +75,14 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks
                                xTaskGetTickCount(),
                                advertisedDevice.getName(),
                                std::deque<int>{advertisedDevice.getRSSI()}});
-      updating = false;
+      xSemaphoreGive(xMutexBleTags);
     }
 };
 
 
 void cleanupTags()
 {
-  updating = true;
+  xSemaphoreTake(xMutexBleTags, portMAX_DELAY);
   for (itags = bletags.begin(); itags != bletags.end();) {
     if(xTaskGetTickCount() < (*itags).lastseen) // uptime counter overflow
       (*itags).lastseen = xTaskGetTickCount();
@@ -85,7 +92,7 @@ void cleanupTags()
       ++itags;
     }
   }
-  updating = false;
+  xSemaphoreGive(xMutexBleTags);
 }
 
 
@@ -98,12 +105,14 @@ void bleTask(void * pvParameters)
   pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
   pBLEScan->setActiveScan(true);
   for (;;) {
-    while(! doScan)
-      delay(1000);
+    bleScanWD = xTaskGetTickCount();
+    xSemaphoreTake(xMutexScan, portMAX_DELAY);
+    Serial.println("Scanning...");
     BLEScanResults foundDevices = pBLEScan->start(scanTime);
-    delay(500);
+    xSemaphoreGive(xMutexScan);
+    delay(1000);
     cleanupTags();
-    delay(1500);
+    delay(100);
   }
 }
 
@@ -120,12 +129,16 @@ void WiFiEvent(WiFiEvent_t event)
       break;
     case SYSTEM_EVENT_STA_DISCONNECTED:
       Serial.println(F("SYSTEM_EVENT_STA_DISCONNECTED"));
-      doScan = false;
+      if(wifiConnect)
+        xSemaphoreTake(xMutexScan, portMAX_DELAY);
+      wifiConnect = false;
       WiFi.reconnect();
       break;
     case SYSTEM_EVENT_STA_GOT_IP:
       Serial.println(F("SYSTEM_EVENT_STA_GOT_IP"));
-      doScan = true;
+      wifiConnect = true;
+      xSemaphoreGive(xMutexScan);
+      ++reconnects;
       break;
     default:
       Serial.print(F("STA other event: "));
@@ -137,7 +150,7 @@ void WiFiEvent(WiFiEvent_t event)
 void dumpTags()
 {
   Serial.println("Tags found (MAC, Timestamp, Name, RSSIs):");
-  while(updating) delay(10);
+  xSemaphoreTake(xMutexBleTags, portMAX_DELAY);
   for (itags = bletags.begin(); itags != bletags.end(); ++itags) {
     Serial.print("  ");
     Serial.print((*itags).mac.c_str());
@@ -153,13 +166,14 @@ void dumpTags()
     }
     Serial.println("<");
   }
+  xSemaphoreGive(xMutexBleTags);
   Serial.println("");
 }
 
 void printTags(WiFiClient* client, std::string mac, short timeout)
 {
   String msg = F("absence;rssi=unreachable;daemon=BLEScanner V0.1");
-  while(updating) delay(10);
+  xSemaphoreTake(xMutexBleTags, portMAX_DELAY);
   for (itags = bletags.begin(); itags != bletags.end(); ++itags) {
     if((*itags).mac == mac) {
       if(((xTaskGetTickCount() - (*itags).lastseen) / 1000) > timeout) {
@@ -171,7 +185,6 @@ void printTags(WiFiClient* client, std::string mac, short timeout)
         msg += F(";rssi=");
         int nrssi = 0;
         std::deque<int>::iterator irssi;
-        while(updating) delay(10);
         for(irssi = (*itags).rssi.begin();irssi != (*itags).rssi.end(); ++irssi) {
           nrssi += (*irssi);
         }
@@ -186,10 +199,18 @@ void printTags(WiFiClient* client, std::string mac, short timeout)
         Serial.print(F(":"));
         Serial.println(client->remotePort());
       }
+      xSemaphoreGive(xMutexBleTags);
       return;
     }
   }
-  client->println(F("absence;rssi=unreachable;daemon=BLEScanner V0.1"));
+  xSemaphoreGive(xMutexBleTags);
+  client->println(msg);
+  Serial.print(F("Sending >"));
+  Serial.print(msg.c_str());
+  Serial.print(F("< to "));
+  Serial.print(client->remoteIP().toString());
+  Serial.print(F(":"));
+  Serial.println(client->remotePort());
 }
 
 
@@ -222,6 +243,8 @@ void handleClient(void * pvParameters)
             cmac.erase(17, strlen(buf) - 17);
             std::transform(cmac.begin(), cmac.end(), cmac.begin(), [](unsigned char c) -> unsigned char { return std::tolower(c); });
             timeout = atoi(buf + 18);
+            printTags(client, cmac, timeout);
+            lastreport = xTaskGetTickCount();
           } else if(strcmp(buf, "now") == 0) {
             if(cmac.length() > 0) {
               printTags(client, cmac, timeout);
@@ -239,12 +262,12 @@ void handleClient(void * pvParameters)
       }
     } else {
       if((xTaskGetTickCount() - lastreport) / 1000 >= timeout) {
-        if(cmac.length() > 0 && doScan) {
+        if(cmac.length() > 0) {
           printTags(client, cmac, timeout);
           lastreport = xTaskGetTickCount();
         }
       }
-      delay(500);
+      delay(100);
     }
   }
   client->stop();
@@ -261,7 +284,7 @@ void wifiTask(void * pvParameters)
   WiFi.begin(ssid, password);
 
   while (WiFi.status() != WL_CONNECTED) {
-    delay(50);
+    delay(100);
   }
 
   Serial.println(F("\nWiFi connected."));
@@ -290,8 +313,8 @@ void wifiTask(void * pvParameters)
         tname += client->remoteIP().toString().c_str();
         tname += ":";
         tname += strremotePort.c_str();
-        xTaskCreate(handleClient, tname.c_str(), 2000, client, 1, &h_task);
-        tasks.push_back(std::make_pair(tname, h_task));
+        xTaskCreate(handleClient, tname.c_str(), 2000, client, 2, &h_task);
+        tasks[h_task] = tname;
         break;
       } else {
         delay(500);
@@ -337,36 +360,45 @@ void setup()
   verbose_print_reset_reason(rtc_get_reset_reason(1));
 
   TaskHandle_t h_task;
-  xTaskCreatePinnedToCore(bleTask, "bleTask", 2000, NULL, 0, &h_task, 0);
-  tasks.push_back(std::make_pair("bleTask", h_task));
-  xTaskCreatePinnedToCore(wifiTask, "wifiTask", 2500, NULL, 1, &h_task, 1);
-  tasks.push_back(std::make_pair("wifiTask", h_task));
+  
+  xTaskCreatePinnedToCore(bleTask, "bleTask", 2500, NULL, 3, &h_task, 0);
+  tasks[h_task] = "bleTask";
+  xSemaphoreTake(xMutexScan, portMAX_DELAY); // will be released by Wifi-Connection-State
+  xTaskCreatePinnedToCore(wifiTask, "wifiTask", 3000, NULL, 1 | portPRIVILEGE_BIT, &h_task, 1);
+  tasks[h_task] = "wifiTask";
 }
 
 void loop() {
-  delay(2000);
+  delay(60000);
   Serial.print(F("Free heap: "));
   Serial.println(esp_get_free_heap_size());
-  delay(2000);
-  std::list<std::pair<std::string, TaskHandle_t>>::iterator ittasks;
-  delay(16000);
+  delay(100);
+  std::map<TaskHandle_t, std::string>::iterator ittasks;
   for(ittasks = tasks.begin(); ittasks != tasks.end();)
   {
-    if(eTaskGetState((*ittasks).second) == eReady) { // should be eDeleted?
+    if(eTaskGetState((*ittasks).first) == eReady && // should be eDeleted?
+       (*ittasks).second.substr(0, 6) == "client") { 
       tasks.erase(ittasks++);
     } else {
       Serial.print("Task ");
-      Serial.print(static_cast<std::string>((*ittasks).first).c_str());
+      Serial.print(((*ittasks).second).c_str());
       Serial.print(" state: ");
-      Serial.print(eTaskGetState((*ittasks).second));
+      Serial.print(eTaskGetState((*ittasks).first));
       Serial.print(" free stack: ");
-      Serial.println(uxTaskGetStackHighWaterMark((*ittasks).second));
+      Serial.println(uxTaskGetStackHighWaterMark((*ittasks).first));
       ++ittasks;
     }
   }
-  delay(2500);
+  delay(100);
   Serial.print("Uptime: ");
   Serial.println(xTaskGetTickCount());
-  delay(2500);
+  delay(100);
   dumpTags();
+  delay(100);
+  Serial.print("Reconnects: ");
+  Serial.println(reconnects);
+  if(xTaskGetTickCount() > bleScanWD + 20000) {
+    // bleTask hanging ....
+    Serial.println("bleTask hanging...");
+  }
 }
