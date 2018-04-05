@@ -11,9 +11,9 @@
 #include <map>
 #include <algorithm>
 
-+const char* ssid     = "ENTER_YOUR_WIFI_SSID_HERE";
-+const char* password = "ENTER_YOUR_WIFI_PASSWORD_HERE";
-+const char* hostname = "ENTER_THE_HOSTNAME_HERE";
+const char* ssid     = "ENTER_YOUR_WIFI_SSID_HERE";
+const char* password = "ENTER_YOUR_WIFI_PASSWORD_HERE";
+const char* hostname = "ENTER_THE_HOSTNAME_HERE";
 uint32_t tagtimeout = 300; // Remove BLETag from list if not seen for n seconds
 
 bool useStaticIP = false;
