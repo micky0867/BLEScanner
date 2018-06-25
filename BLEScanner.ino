@@ -16,6 +16,7 @@ const char* password = "ENTER_YOUR_WIFI_PASSWORD_HERE";
 const char* hostname = "ENTER_THE_HOSTNAME_HERE";
 uint32_t tagtimeout = 300; // Remove BLETag from list if not seen for n seconds
 
+
 bool useStaticIP = false;
 IPAddress local_IP(192, 168, 178, 78);
 IPAddress gateway(192, 168, 178, 1);
@@ -31,7 +32,9 @@ static BLEAddress* pAddress;
 static BLERemoteService* pRemoteService;
 static BLERemoteCharacteristic* pRemoteCharacteristic;
 
-int reconnects = 0;
+TaskHandle_t h_bletask;
+int reconnects = -1;
+int blerestarts = 0;
 bool wifiConnect = false;
 uint32_t bleScanWD;
 SemaphoreHandle_t  xMutexBleTags = xSemaphoreCreateMutex( );
@@ -350,7 +353,7 @@ void verbose_print_reset_reason(RESET_REASON reason)
 void setup()
 {
   esp_log_level_set("*", ESP_LOG_NONE);
-  Serial.begin(115200);
+  Serial.begin(57600);
   delay(2000);
 
   Serial.print(F("CPU0 reset reason: "));
@@ -361,8 +364,8 @@ void setup()
 
   TaskHandle_t h_task;
   
-  xTaskCreatePinnedToCore(bleTask, "bleTask", 2500, NULL, 3, &h_task, 0);
-  tasks[h_task] = "bleTask";
+  xTaskCreatePinnedToCore(bleTask, "bleTask", 2500, NULL, 3, &h_bletask, 0);
+  tasks[h_bletask] = "bleTask";
   xSemaphoreTake(xMutexScan, portMAX_DELAY); // will be released by Wifi-Connection-State
   xTaskCreatePinnedToCore(wifiTask, "wifiTask", 3000, NULL, 1 | portPRIVILEGE_BIT, &h_task, 1);
   tasks[h_task] = "wifiTask";
@@ -397,8 +400,17 @@ void loop() {
   delay(100);
   Serial.print("Reconnects: ");
   Serial.println(reconnects);
+  Serial.print("BLE-Task restarts: ");
+  Serial.println(blerestarts);
+
   if(xTaskGetTickCount() > bleScanWD + 20000) {
     // bleTask hanging ....
-    Serial.println("bleTask hanging...");
+    Serial.println("bleTask hanging...restarting it");
+    tasks.erase(h_bletask);
+    vTaskDelete(h_bletask);
+    xTaskCreatePinnedToCore(bleTask, "bleTask", 2500, NULL, 0, &h_bletask, 0);
+    tasks[h_bletask] = "bleTask";
+    ++blerestarts;
   }
 }
+
