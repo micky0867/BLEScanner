@@ -1,6 +1,7 @@
 
 BLEScanner aims to be a replacement for lepresenced in FHEM.
 See https://wiki.fhem.de/wiki/PRESENCE
+and the thread https://forum.fhem.de/index.php/topic,28753.0.html
 
 It is based on Espressif's ESP32s (ESP-WROOM-32), which has
 Wifi and Bluetooth-LE on board.

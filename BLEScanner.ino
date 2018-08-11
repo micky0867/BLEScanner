@@ -1,3 +1,22 @@
+/********************************************************************************
+* 
+* BLEScanner by micky0867
+* 
+* For use with PRESENCE modul in FHEM 
+* A cheap solution for (multiple) BLE detectors
+* 
+* History
+* 
+* V0.1 (06.01.2018)
+*   Initial version
+* 
+* V0.2 (11.08.2018)
+*   Use watchdog to recover from hanging bleTask
+*   Count uptime in seconds (nearly)
+*   Fastdetection to re-detect Tags within seconds
+* 
+********************************************************************************/
+
 #include <Arduino.h>
 #include <esp_log.h>
 #include <esp_task_wdt.h>
@@ -10,12 +29,19 @@
 #include <list>
 #include <map>
 #include <algorithm>
+#include <esp_task_wdt.h>
 
 const char* ssid     = "ENTER_YOUR_WIFI_SSID_HERE";
 const char* password = "ENTER_YOUR_WIFI_PASSWORD_HERE";
 const char* hostname = "ENTER_THE_HOSTNAME_HERE";
-uint32_t tagtimeout = 300; // Remove BLETag from list if not seen for n seconds
 
+//scanduration in seconds
+int scanTime = 8; 
+
+// Timeout:
+// Not yet requested Tags: Remove from list if not seen for n seconds
+// Already requested Tags: Invalidate RSSI data for faster re-detection
+uint32_t tagtimeout = 180;
 
 bool useStaticIP = false;
 IPAddress local_IP(192, 168, 178, 78);
@@ -24,7 +50,7 @@ IPAddress subnet(255, 255, 255, 0);
 IPAddress primaryDNS(192, 168, 178, 1); //optional
 IPAddress secondaryDNS(8, 8, 8, 8); //optional
 WiFiServer server(3333, 16);  // Port, Maxclients
-int scanTime = 8; //In seconds
+
 
 
 static BLEClient* pClient;
@@ -34,15 +60,16 @@ static BLERemoteCharacteristic* pRemoteCharacteristic;
 
 TaskHandle_t h_bletask;
 int reconnects = -1;
-int blerestarts = 0;
 bool wifiConnect = false;
-uint32_t bleScanWD;
+double tickspersec = pdMS_TO_TICKS(1000);
+long uptimesec = 0;
+
 SemaphoreHandle_t  xMutexBleTags = xSemaphoreCreateMutex( );
 SemaphoreHandle_t  xMutexScan = xSemaphoreCreateMutex( );
 
 struct BLETag {
   std::string mac;
-  uint32_t lastseen;
+  long lastseen;
   std::string tname;
   std::deque<int> rssi;
 };
@@ -51,7 +78,7 @@ std::list<BLETag> bletags;
 std::list<BLETag>::iterator itags;
 
 std::map<TaskHandle_t, std::string> tasks;
-
+std::map<std::string, short> fastdetection;
 
 
 class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks
@@ -60,14 +87,18 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks
       xSemaphoreTake(xMutexBleTags, portMAX_DELAY);
       for (itags = bletags.begin(); itags != bletags.end(); ++itags) {
         if((*itags).mac == advertisedDevice.getAddress().toString()) {
-          (*itags).lastseen = xTaskGetTickCount();
+          (*itags).lastseen = uptimesec;
           if (advertisedDevice.getName().length() > 0 &&
               advertisedDevice.getName() != (*itags).tname) {
             (*itags).tname = advertisedDevice.getName();
           }
           
           (*itags).rssi.push_back(advertisedDevice.getRSSI());
-          if((*itags).rssi.size() > 5) (*itags).rssi.pop_front();
+          if((*itags).rssi.size() > 5)
+            (*itags).rssi.pop_front();
+          if((*itags).rssi.size() == 1 && fastdetection.find((*itags).mac) != fastdetection.end() && fastdetection[(*itags).mac] == 0) {
+            fastdetection[(*itags).mac] = 1;
+          }
           xSemaphoreGive(xMutexBleTags);
           return;
         }
@@ -75,7 +106,7 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks
       std::string nmac = advertisedDevice.getAddress().toString();
       std::transform(nmac.begin(), nmac.end(), nmac.begin(), ::tolower);
       bletags.push_back(BLETag{nmac,
-                               xTaskGetTickCount(),
+                               uptimesec,
                                advertisedDevice.getName(),
                                std::deque<int>{advertisedDevice.getRSSI()}});
       xSemaphoreGive(xMutexBleTags);
@@ -87,10 +118,15 @@ void cleanupTags()
 {
   xSemaphoreTake(xMutexBleTags, portMAX_DELAY);
   for (itags = bletags.begin(); itags != bletags.end();) {
-    if(xTaskGetTickCount() < (*itags).lastseen) // uptime counter overflow
-      (*itags).lastseen = xTaskGetTickCount();
-    if((xTaskGetTickCount() - (*itags).lastseen) / 1000 > tagtimeout) {
-      bletags.erase(itags++);
+    // if(xTaskGetTickCount() < (*itags).lastseen) // uptime counter overflow
+    //  (*itags).lastseen = xTaskGetTickCount();
+    if((uptimesec - (*itags).lastseen) > tagtimeout) {
+      if(fastdetection.find((*itags).mac) != fastdetection.end()) {
+        (*itags).rssi.clear();
+        ++itags;
+      } else {
+        bletags.erase(itags++);
+      }
     } else {
       ++itags;
     }
@@ -101,6 +137,7 @@ void cleanupTags()
 
 void bleTask(void * pvParameters)
 {
+  esp_task_wdt_add(NULL);
   Serial.println(F("Starting BLE init"));
   BLEDevice::init("");
   BLEScan* pBLEScan;
@@ -108,9 +145,12 @@ void bleTask(void * pvParameters)
   pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
   pBLEScan->setActiveScan(true);
   for (;;) {
-    bleScanWD = xTaskGetTickCount();
-    xSemaphoreTake(xMutexScan, portMAX_DELAY);
-    Serial.println("Scanning...");
+    esp_task_wdt_reset();
+    while(xSemaphoreTake(xMutexScan, scanTime * tickspersec) == pdFALSE) {
+      esp_task_wdt_reset();
+      delay(100);
+    }
+    Serial.println("Scanning ...");
     BLEScanResults foundDevices = pBLEScan->start(scanTime);
     xSemaphoreGive(xMutexScan);
     delay(1000);
@@ -152,6 +192,7 @@ void WiFiEvent(WiFiEvent_t event)
 
 void dumpTags()
 {
+
   Serial.println("Tags found (MAC, Timestamp, Name, RSSIs):");
   xSemaphoreTake(xMutexBleTags, portMAX_DELAY);
   for (itags = bletags.begin(); itags != bletags.end(); ++itags) {
@@ -173,13 +214,13 @@ void dumpTags()
   Serial.println("");
 }
 
-void printTags(WiFiClient* client, std::string mac, short timeout)
+void printTags(WiFiClient* client, std::string mac, short timeout, String reason)
 {
-  String msg = F("absence;rssi=unreachable;daemon=BLEScanner V0.1");
+  String msg = F("absence;rssi=unreachable;daemon=BLEScanner V0.2");
   xSemaphoreTake(xMutexBleTags, portMAX_DELAY);
   for (itags = bletags.begin(); itags != bletags.end(); ++itags) {
     if((*itags).mac == mac) {
-      if(((xTaskGetTickCount() - (*itags).lastseen) / 1000) > timeout) {
+      if(((uptimesec - (*itags).lastseen)) > timeout) {
         client->println(msg);
         break;
       } else {
@@ -193,14 +234,18 @@ void printTags(WiFiClient* client, std::string mac, short timeout)
         }
         nrssi /= static_cast<int>((*itags).rssi.size());
         msg += String(nrssi);
-        msg += F(";daemon=BLEScanner V0.1");
+        msg += F(";daemon=BLEScanner V0.2");
         client->println(msg.c_str());
         Serial.print(F("Sending >"));
         Serial.print(msg.c_str());
         Serial.print(F("< to "));
         Serial.print(client->remoteIP().toString());
         Serial.print(F(":"));
-        Serial.println(client->remotePort());
+        Serial.print(client->remotePort());
+        Serial.print(F(" for tag "));
+        Serial.print(mac.c_str());
+        Serial.print(F(", Reason: "));
+        Serial.println(reason);
       }
       xSemaphoreGive(xMutexBleTags);
       return;
@@ -213,7 +258,11 @@ void printTags(WiFiClient* client, std::string mac, short timeout)
   Serial.print(F("< to "));
   Serial.print(client->remoteIP().toString());
   Serial.print(F(":"));
-  Serial.println(client->remotePort());
+  Serial.print(client->remotePort());
+  Serial.print(F(" for tag "));
+  Serial.print(mac.c_str());
+  Serial.print(F(", Reason: "));
+  Serial.println(reason);
 }
 
 
@@ -246,12 +295,13 @@ void handleClient(void * pvParameters)
             cmac.erase(17, strlen(buf) - 17);
             std::transform(cmac.begin(), cmac.end(), cmac.begin(), [](unsigned char c) -> unsigned char { return std::tolower(c); });
             timeout = atoi(buf + 18);
-            printTags(client, cmac, timeout);
-            lastreport = xTaskGetTickCount();
+            fastdetection[cmac] = 0;
+            printTags(client, cmac, timeout, "on request");
+            lastreport = uptimesec;
           } else if(strcmp(buf, "now") == 0) {
             if(cmac.length() > 0) {
-              printTags(client, cmac, timeout);
-              lastreport = xTaskGetTickCount();
+              printTags(client, cmac, timeout, "forced request");
+              lastreport = uptimesec;
             }
           } else if(strcmp(buf, "DEBUG") == 0) {
             esp_log_level_set("*", ESP_LOG_DEBUG);
@@ -264,11 +314,13 @@ void handleClient(void * pvParameters)
         }
       }
     } else {
-      if((xTaskGetTickCount() - lastreport) / 1000 >= timeout) {
-        if(cmac.length() > 0) {
-          printTags(client, cmac, timeout);
-          lastreport = xTaskGetTickCount();
-        }
+      if(cmac.length() > 0 && (uptimesec - lastreport) >= timeout) {
+        printTags(client, cmac, timeout, "periodic report");
+        lastreport = uptimesec;
+      } else if(cmac.length() > 0 && fastdetection[cmac] == 1) {
+        printTags(client, cmac, timeout, "fastdetection");
+        lastreport = uptimesec;
+        delay(1000); 
       }
       delay(100);
     }
@@ -289,7 +341,8 @@ void wifiTask(void * pvParameters)
   while (WiFi.status() != WL_CONNECTED) {
     delay(100);
   }
-
+  
+  esp_task_wdt_add(NULL);
   Serial.println(F("\nWiFi connected."));
   Serial.println(F("IP address: "));
   Serial.println(WiFi.localIP());
@@ -303,6 +356,7 @@ void wifiTask(void * pvParameters)
   for (;;) {
     WiFiClient* client = new WiFiClient();
     for(;;) {
+      esp_task_wdt_reset();
       *client = server.available();
       if(*client) {
         Serial.print(F("New connection from "));
@@ -354,7 +408,8 @@ void setup()
 {
   esp_log_level_set("*", ESP_LOG_NONE);
   Serial.begin(57600);
-  delay(2000);
+  delay(2260);
+  uptimesec = 2;
 
   Serial.print(F("CPU0 reset reason: "));
   verbose_print_reset_reason(rtc_get_reset_reason(0));
@@ -369,13 +424,22 @@ void setup()
   xSemaphoreTake(xMutexScan, portMAX_DELAY); // will be released by Wifi-Connection-State
   xTaskCreatePinnedToCore(wifiTask, "wifiTask", 3000, NULL, 1 | portPRIVILEGE_BIT, &h_task, 1);
   tasks[h_task] = "wifiTask";
+  Serial.print("Ticks per second: ");
+  Serial.println(tickspersec);
+  esp_task_wdt_init(scanTime * 12, true);
+  
 }
 
 void loop() {
-  delay(60000);
+  for(short i=0; i<60; ++i) {
+    delay(1000);
+    ++uptimesec;
+  }
+  
+
   Serial.print(F("Free heap: "));
   Serial.println(esp_get_free_heap_size());
-  delay(100);
+  // delay(100);
   std::map<TaskHandle_t, std::string>::iterator ittasks;
   for(ittasks = tasks.begin(); ittasks != tasks.end();)
   {
@@ -392,25 +456,22 @@ void loop() {
       ++ittasks;
     }
   }
-  delay(100);
+  Serial.println("Tags for faster detection:");
+  for(const auto& pair : fastdetection) {
+    Serial.print("  >");
+    Serial.println(pair.first.c_str());
+  }
+  if(fastdetection.size() == 0)
+    Serial.println("  >none");
+  // delay(100);
   Serial.print("Uptime: ");
-  Serial.println(xTaskGetTickCount());
-  delay(100);
+  Serial.println(uptimesec);
+  // delay(100);
   dumpTags();
-  delay(100);
+  // delay(100);
   Serial.print("Reconnects: ");
   Serial.println(reconnects);
-  Serial.print("BLE-Task restarts: ");
-  Serial.println(blerestarts);
-
-  if(xTaskGetTickCount() > bleScanWD + 20000) {
-    // bleTask hanging ....
-    Serial.println("bleTask hanging...restarting it");
-    tasks.erase(h_bletask);
-    vTaskDelete(h_bletask);
-    xTaskCreatePinnedToCore(bleTask, "bleTask", 2500, NULL, 0, &h_bletask, 0);
-    tasks[h_bletask] = "bleTask";
-    ++blerestarts;
-  }
+  Serial.print("Uptime: ");
+  Serial.println(uptimesec);
 }
 
