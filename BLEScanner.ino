@@ -14,9 +14,12 @@
 *   Use watchdog to recover from hanging bleTask
 *   Count uptime in seconds (nearly)
 *   Fastdetection to re-detect Tags within seconds
+*   
+* V0.3 (07.09.2018)
+*   New watchdog strategy
 * 
 ********************************************************************************/
-
+#define _USEWATCHDOG_ 1
 #include <Arduino.h>
 #include <esp_log.h>
 #include <esp_task_wdt.h>
@@ -29,7 +32,6 @@
 #include <list>
 #include <map>
 #include <algorithm>
-#include <esp_task_wdt.h>
 
 const char* ssid     = "ENTER_YOUR_WIFI_SSID_HERE";
 const char* password = "ENTER_YOUR_WIFI_PASSWORD_HERE";
@@ -60,9 +62,13 @@ static BLERemoteCharacteristic* pRemoteCharacteristic;
 
 TaskHandle_t h_bletask;
 int reconnects = -1;
+int restarts = 0;
 bool wifiConnect = false;
 double tickspersec = pdMS_TO_TICKS(1000);
 long uptimesec = 0;
+long blealivesec = 0;
+boolean blockble = false;      // block ble-task for testing
+boolean blockforever = false;  // keep ble-task blocked
 
 SemaphoreHandle_t  xMutexBleTags = xSemaphoreCreateMutex( );
 SemaphoreHandle_t  xMutexScan = xSemaphoreCreateMutex( );
@@ -137,7 +143,10 @@ void cleanupTags()
 
 void bleTask(void * pvParameters)
 {
+#ifdef _USEWATCHDOG_
   esp_task_wdt_add(NULL);
+#endif
+
   Serial.println(F("Starting BLE init"));
   BLEDevice::init("");
   BLEScan* pBLEScan;
@@ -145,9 +154,18 @@ void bleTask(void * pvParameters)
   pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
   pBLEScan->setActiveScan(true);
   for (;;) {
+    while(blockble) {
+      // loop for watchdog test
+    }
+    blealivesec = uptimesec;
+#ifdef _USEWATCHDOG_
     esp_task_wdt_reset();
+#endif
     while(xSemaphoreTake(xMutexScan, scanTime * tickspersec) == pdFALSE) {
+#ifdef _USEWATCHDOG_
       esp_task_wdt_reset();
+#endif
+      blealivesec = uptimesec;
       delay(100);
     }
     Serial.println("Scanning ...");
@@ -216,7 +234,7 @@ void dumpTags()
 
 void printTags(WiFiClient* client, std::string mac, short timeout, String reason)
 {
-  String msg = F("absence;rssi=unreachable;daemon=BLEScanner V0.2");
+  String msg = F("absence;rssi=unreachable;daemon=BLEScanner V0.3");
   xSemaphoreTake(xMutexBleTags, portMAX_DELAY);
   for (itags = bletags.begin(); itags != bletags.end(); ++itags) {
     if((*itags).mac == mac) {
@@ -307,6 +325,13 @@ void handleClient(void * pvParameters)
             esp_log_level_set("*", ESP_LOG_DEBUG);
           } else if(strcmp(buf, "NODEBUG") == 0) {
             esp_log_level_set("*", ESP_LOG_NONE);
+          } else if(strcmp(buf, "BLOCKBLE") == 0) {
+            Serial.println("BLE Task blocked!");
+            blockble = true;
+          } else if(strcmp(buf, "BLOCKFOREVER") == 0) {
+            Serial.println("BLE Task blocked forever!");
+            blockble = true;
+            blockforever = true;
           }
           pos = 0;
         } else {
@@ -341,8 +366,10 @@ void wifiTask(void * pvParameters)
   while (WiFi.status() != WL_CONNECTED) {
     delay(100);
   }
-  
+
+#ifdef _USEWATCHDOG_
   esp_task_wdt_add(NULL);
+#endif
   Serial.println(F("\nWiFi connected."));
   Serial.println(F("IP address: "));
   Serial.println(WiFi.localIP());
@@ -356,7 +383,9 @@ void wifiTask(void * pvParameters)
   for (;;) {
     WiFiClient* client = new WiFiClient();
     for(;;) {
+  #ifdef _USEWATCHDOG_
       esp_task_wdt_reset();
+  #endif
       *client = server.available();
       if(*client) {
         Serial.print(F("New connection from "));
@@ -426,16 +455,34 @@ void setup()
   tasks[h_task] = "wifiTask";
   Serial.print("Ticks per second: ");
   Serial.println(tickspersec);
-  esp_task_wdt_init(scanTime * 12, true);
-  
+#ifdef _USEWATCHDOG_ 
+  esp_task_wdt_init(scanTime * 4, true);
+#endif
 }
 
 void loop() {
   for(short i=0; i<60; ++i) {
-    delay(1000);
+    delay(tickspersec);
     ++uptimesec;
+#ifdef _USEWATCHDOG_
+    // detect hanging BLE-Taks, before it is detected by esp_watchdog
+    if(uptimesec - blealivesec > scanTime * 2  && !blockforever) {
+      Serial.print("BLE-Task is hanging for ");
+      Serial.print(uptimesec - blealivesec);
+      Serial.println(" seconds");
+      esp_task_wdt_delete(h_bletask);
+      vTaskDelete(h_bletask);
+      tasks.erase(h_bletask);
+      delay(tickspersec);
+      ++uptimesec;
+      Serial.println("Restarting BLE-Task");
+      xTaskCreatePinnedToCore(bleTask, "bleTask", 2500, NULL, 3, &h_bletask, 0);
+      tasks[h_bletask] = "bleTask";
+      blockble = false;
+      ++restarts;
+    }
+#endif
   }
-  
 
   Serial.print(F("Free heap: "));
   Serial.println(esp_get_free_heap_size());
@@ -465,12 +512,15 @@ void loop() {
     Serial.println("  >none");
   // delay(100);
   Serial.print("Uptime: ");
-  Serial.println(uptimesec);
+  Serial.print(uptimesec);
+  Serial.println(" seconds");
   // delay(100);
   dumpTags();
   // delay(100);
-  Serial.print("Reconnects: ");
+  Serial.print("Reconnects:   ");
   Serial.println(reconnects);
+  Serial.print("BLE-Restarts: ");
+  Serial.println(restarts);
   Serial.print("Uptime: ");
   Serial.println(uptimesec);
 }
